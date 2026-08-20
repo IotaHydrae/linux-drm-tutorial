@@ -151,7 +151,8 @@ encoder and a connector, then asks the kernel's fbdev emulation to expose the
 pipeline as `/dev/fb0`. This section is written as a tour:
 
 - sections 0 and 1 build the mental model (what DRM/KMS objects are and how
-  they are wired) - start there if DRM is new to you;
+  they are wired) - start there if DRM is new to you; sections 1.1-1.5 then
+  zoom into each KMS object one by one;
 - sections 2 and 3 show how the driver registers and how `/dev/fb0` appears;
 - section 4 explains, first in plain words and then in exact kernel call
   order, what happens when a user writes pixels to the framebuffer;
@@ -247,6 +248,184 @@ same driver code paths.
 - The **framebuffer** is the glue between KMS objects and memory: it stores
   the geometry (width/height/pitch/format) and a handle to a GEM object
   (`fb->obj[0]`), which is where the actual pixel bytes live.
+
+Each of the five objects now gets its own section: 1.1 framebuffer, 1.2
+plane, 1.3 CRTC, 1.4 encoder, 1.5 connector.
+
+##### 1.1 Framebuffer and GEM memory
+
+**Role.** A framebuffer (`struct drm_framebuffer`) is a description of a 2D
+pixel buffer: width and height, pixel format (RGB565), pitch (bytes per
+scanline), modifiers, and one or more references to GEM objects
+(`fb->obj[0]` in this driver). It is the "film" from the analogy in section
+0: the pixel data the plane reads.
+
+**Creation.** Every framebuffer is created through
+`mode_config.funcs->fb_create`, which the driver sets to
+`drm_gem_fb_create_with_dirty`:
+
+- userspace: `DRM_IOCTL_MODE_ADDFB2` → `drm_mode_addfb2()` → `fb_create`;
+- the fbdev client: `drm_client_framebuffer_create()` → the same `fb_create`
+  (this produces the backing store of `/dev/fb0`).
+
+`drm_gem_fb_create_with_dirty()` validates the requested format against the
+plane's format list, creates the `drm_framebuffer`, and attaches
+`.dirty = drm_atomic_helper_dirtyfb` to it. That hook is what turns damage
+clips into atomic commits in the write path (section 4).
+
+**Memory behind it.** `fb->obj[0]` is a `struct drm_gem_object`; in this
+driver it is always a DMA GEM object:
+`to_drm_gem_dma_obj(obj)` exposes `dma_addr` (for hardware) and `vaddr` (the
+kernel CPU mapping). The fbdev client allocates it through
+`drm_gem_dma_dumb_create` as a *dumb buffer*: plain CPU-writable memory, no
+GPU involved.
+
+**Lifecycle.** The atomic helpers take and release framebuffer references
+around commits, so a framebuffer is never freed while a plane still points at
+it.
+
+Kernel files: `drm_framebuffer.c`, `drm_gem_framebuffer_helper.c`,
+`drm_gem_dma_helper.c`.
+
+##### 1.2 Plane
+
+**Role.** A plane selects one framebuffer and places it on the screen. Real
+drivers have several planes (primary, cursor, overlay); this driver has
+exactly one primary plane: fixed size, RGB565, no scaling.
+
+**In drm.c.** `drm_tutorial_create_plane()`:
+
+- `drm_universal_plane_init(dev, plane, 0, ...)` - `possible_crtcs = 0`
+  here; the CRTC fills it in later (see 1.3);
+- format list `{ DRM_FORMAT_RGB565 }`, modifiers
+  `{ DRM_FORMAT_MOD_LINEAR, DRM_FORMAT_MOD_INVALID }` - only plain linear
+  RGB565 framebuffers are accepted;
+- type `DRM_PLANE_TYPE_PRIMARY`.
+
+**Callbacks.**
+
+| Table | Entry | Value | Called when |
+| ----- | ----- | ----- | ----------- |
+| `drm_plane_funcs` | `.reset` | `drm_gem_reset_shadow_plane` | state is (re)initialized |
+| | `.atomic_duplicate_state` | `drm_gem_duplicate_shadow_plane_state` | state is copied for a commit |
+| | `.atomic_destroy_state` | `drm_gem_destroy_shadow_plane_state` | state is freed |
+| | `.update_plane` | `drm_atomic_helper_update_plane` | plane update ioctl |
+| | `.disable_plane` | `drm_atomic_helper_disable_plane` | plane is disabled |
+| `drm_plane_helper_funcs` | `.begin_fb_access` | `drm_gem_begin_shadow_fb_access` | before `atomic_update`: vmap the fb |
+| | `.end_fb_access` | `drm_gem_end_shadow_fb_access` | after `atomic_update`: vunmap the fb |
+| | `.atomic_check` | `drm_tutorial_plane_helper_atomic_check` | atomic check phase |
+| | `.atomic_update` | `drm_tutorial_plane_helper_atomic_update` | atomic commit phase |
+
+Because the state callbacks are the *shadow* variants, the plane state is a
+`struct drm_shadow_plane_state`: the standard plane state plus `map`/`data`
+slots that hold the framebuffer's kernel mapping while a commit is in flight.
+
+**Damage.** `drm_plane_enable_fb_damage_clips()` adds the standard
+`FB_DAMAGE_CLIPS` property. `drm_atomic_helper_dirtyfb()` writes the damage
+blob into `plane_state->fb_damage_clips`; the check phase converts it into
+`plane_state->damage` (section 5).
+
+**Neighbors.** plane ↔ CRTC: `crtc->primary` and
+`plane->possible_crtcs = drm_crtc_mask(crtc)` (set by
+`drm_crtc_init_with_planes()`); plane ↔ framebuffer: `plane->state->fb`.
+
+Kernel files: `drm_plane.c`, `drm_gem_atomic_helper.c`.
+
+##### 1.3 CRTC
+
+**Role.** The CRTC owns the timing: it scans the primary plane out line by
+line at the fixed 128x160 mode and produces the pixel stream for the encoder.
+This driver has no real hardware, so the callbacks mostly validate and log.
+
+**In drm.c.** `drm_tutorial_create_crtc()`:
+
+- `drm_crtc_init_with_planes(dev, crtc, &plane, NULL,
+  &drm_tutorial_crtc_funcs, NULL)` binds the plane from 1.2 as
+  `crtc->primary`; because the plane was created with `possible_crtcs = 0`,
+  the helper fills it in with `drm_crtc_mask(crtc)` (`drm_crtc.c`).
+
+**Callbacks.**
+
+| Table | Entry | Value | Called when |
+| ----- | ----- | ----- | ----------- |
+| `drm_crtc_funcs` | `.reset` | `drm_atomic_helper_crtc_reset` | state is (re)initialized |
+| | `.set_config` | `drm_atomic_helper_set_config` | legacy `SETCONFIG` ioctl |
+| | `.page_flip` | `drm_atomic_helper_page_flip` | `PAGE_FLIP` ioctl |
+| | `.atomic_duplicate_state` / `.atomic_destroy_state` | atomic helpers | state copy/free |
+| `drm_crtc_helper_funcs` | `.mode_valid` | `drm_tutorial_crtc_helper_mode_valid` | mode validation during `fill_modes` |
+| | `.atomic_check` | `drm_tutorial_crtc_helper_atomic_check` | atomic check phase |
+| | `.atomic_enable` / `.atomic_disable` | log only | commit tail |
+
+**Check logic.** `drm_tutorial_crtc_helper_atomic_check()` verifies that a
+primary plane is present when the CRTC is enabled
+(`drm_atomic_helper_check_crtc_primary_plane()`), then calls
+`drm_atomic_add_affected_planes()` - any commit touching this CRTC also pulls
+its plane into the same atomic state.
+
+**Neighbors.** CRTC → plane (`crtc->primary`), CRTC ← encoder
+(`encoder->possible_crtcs`), CRTC ← modes
+(`drm_crtc_helper_mode_valid_fixed`).
+
+Kernel files: `drm_crtc.c`, `drm_atomic_helper.c`.
+
+##### 1.4 Encoder
+
+**Role.** The encoder converts the CRTC's pixel stream into the signal format
+expected by the connector (LVDS, HDMI TMDS, ...). This tutorial has no real
+signal, so it registers `DRM_MODE_ENCODER_NONE` - a pass-through placeholder
+that still carries the topology link between CRTC and connector.
+
+**In drm.c.** `drm_tutorial_create_encoder()`:
+
+- `drm_encoder_init(dev, encoder, &drm_tutorial_encoder_funcs,
+  DRM_MODE_ENCODER_NONE, NULL)`;
+- `encoder->possible_crtcs = drm_crtc_mask(crtc)` - the single CRTC may drive
+  this encoder.
+
+**Callbacks.** Only `.destroy = drm_encoder_cleanup`; there is no `mode_valid`
+and no atomic hook. The encoder exists mainly for topology and validation
+(`drm_encoder_mode_valid()` is simply skipped because the hook is NULL).
+
+**Neighbors.** encoder ↔ CRTC (`possible_crtcs`), encoder ↔ connector
+(`drm_connector_attach_encoder()` links both ways).
+
+Kernel files: `drm_encoder.c`, `drm_probe_helper.c` (`drm_encoder_mode_valid`).
+
+##### 1.5 Connector
+
+**Role.** The connector represents the physical plug and answers "what modes
+can this display show?". Since the tutorial has no real display, the
+connector is virtual (`DRM_MODE_CONNECTOR_Unknown`) and always reports the
+single fixed 128x160 mode.
+
+**In drm.c.** `drm_tutorial_create_connector()`:
+
+- `drm_connector_init(dev, connector, &drm_tutorial_connector_funcs,
+  DRM_MODE_CONNECTOR_Unknown)`;
+- `drm_connector_helper_add()` with `.get_modes =
+  drm_tutorial_connector_get_modes`, which delegates to
+  `drm_connector_helper_get_modes_fixed()`: duplicate the fixed mode, mark it
+  `DRM_MODE_TYPE_PREFERRED`, add it to the probed-mode list;
+- `drm_connector_attach_encoder()` - the link to the encoder from 1.4.
+
+**Callbacks.**
+
+| Table | Entry | Value | Called when |
+| ----- | ----- | ----- | ----------- |
+| `drm_connector_funcs` | `.fill_modes` | `drm_helper_probe_single_connector_modes` | mode probing (`GETCONNECTOR`, fbdev client) |
+| | `.reset` / `.atomic_duplicate_state` / `.atomic_destroy_state` | atomic helpers | connector state |
+| `drm_connector_helper_funcs` | `.get_modes` | `drm_tutorial_connector_get_modes` | populates the probed-mode list |
+
+**Mode flow.** `fill_modes` → `get_modes` →
+`__drm_helper_update_and_validate` (validate driver/size/flag/pipeline, with
+the CRTC's `mode_valid` at the end of the chain) → the surviving mode lands
+in `connector->modes`, where userspace and the fbdev client pick it up.
+
+**Neighbors.** connector ↔ encoder (`attach_encoder`), connector ↔ modes
+(`connector->modes` after probing), connector ↔ CRTC indirectly through the
+encoder's `possible_crtcs`.
+
+Kernel files: `drm_connector.c`, `drm_probe_helper.c`.
 
 #### 2. Module load and device registration
 
