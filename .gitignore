@@ -53,6 +53,7 @@ dkms.conf
 
 test/*.out
 *.png
+!assets/*.png
 .cache/
 build/
 target/

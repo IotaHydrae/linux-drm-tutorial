@@ -85,6 +85,10 @@ cp dump.png /mnt/c/Users/Admin/Downloads
 ./tools/fbview.py               # live preview of /dev/fb0
 ```
 
+Example result - fbcon console text rendered on the virtual framebuffer:
+
+![Virtual framebuffer dump](assets/dump.png)
+
 #### Under QEMU
 
 ```bash

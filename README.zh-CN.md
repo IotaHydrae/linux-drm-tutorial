@@ -81,6 +81,10 @@ cp dump.png /mnt/c/Users/Admin/Downloads
 ./tools/fbview.py               # 实时预览 /dev/fb0
 ```
 
+示例效果——fbcon 控制台文字渲染在虚拟 framebuffer 上：
+
+![虚拟 framebuffer 截图](assets/dump.png)
+
 #### 在 QEMU 中
 
 ```bash
