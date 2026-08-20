@@ -1,3 +1,5 @@
+[**English**](README.md) | [**简体中文**](README.zh-CN.md)
+
 # Linux DRM driver tutorial
 
 A minimal atomic KMS driver for Linux, built as an out-of-tree module and
