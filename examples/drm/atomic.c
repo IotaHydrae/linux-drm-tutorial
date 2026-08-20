@@ -24,6 +24,10 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#if defined(__x86_64__) || defined(__i386__)
+#include <emmintrin.h>
+#endif
+
 #include <drm/drm.h>
 #include <drm/drm_mode.h>
 #include <drm/drm_fourcc.h>
@@ -95,6 +99,14 @@ static struct drm_mode_modeinfo *pick_mode(struct drm_mode_get_connector *conn)
 int main(int argc, char **argv)
 {
   const char *dev = argc > 1 ? argv[1] : "/dev/dri/card0";
+  struct drm_set_client_cap cap = {
+    .capability = DRM_CLIENT_CAP_UNIVERSAL_PLANES,
+    .value = 1,
+  };
+  struct drm_set_client_cap atomic_cap = {
+    .capability = DRM_CLIENT_CAP_ATOMIC,
+    .value = 1,
+  };
   struct drm_mode_card_res res = { 0 };
   struct drm_mode_get_connector conn = { 0 };
   struct drm_mode_get_encoder enc = { 0 };
@@ -105,8 +117,10 @@ int main(int argc, char **argv)
   struct drm_mode_create_blob blob = { 0 };
   struct drm_mode_atomic req = { 0 };
   struct drm_mode_modeinfo *mode;
-  uint32_t *crtc_ids, *conn_ids, *plane_ids = NULL;
+  uint32_t *fb_ids, *crtc_ids, *conn_ids, *enc_ids, *plane_ids = NULL;
   uint32_t connector_id, crtc_id = 0, encoder_id, plane_id;
+  uint32_t *conn_props = NULL;
+  uint64_t *conn_prop_values = NULL;
   uint32_t plane_fb_prop, plane_crtc_prop;
   uint32_t crtc_mode_prop, crtc_active_prop, conn_crtc_prop;
   uint32_t objs[3], counts[3], props[5];
@@ -121,6 +135,13 @@ int main(int argc, char **argv)
   if (drm_ioctl(fd, DRM_IOCTL_SET_MASTER, 0) < 0)
     perror("SET_MASTER (ignored)");
 
+  /* primary planes are hidden unless this capability is set */
+  if (drm_ioctl(fd, DRM_IOCTL_SET_CLIENT_CAP, &cap) < 0)
+    perror("SET_CLIENT_CAP (ignored)");
+  /* MODE_ATOMIC rejects clients without the atomic capability */
+  if (drm_ioctl(fd, DRM_IOCTL_SET_CLIENT_CAP, &atomic_cap) < 0)
+    perror("SET_CLIENT_CAP ATOMIC (ignored)");
+
   if (drm_ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &res) < 0) {
     perror("MODE_GETRESOURCES");
     return 1;
@@ -131,8 +152,13 @@ int main(int argc, char **argv)
   }
   conn_ids = calloc(res.count_connectors, sizeof(*conn_ids));
   crtc_ids = calloc(res.count_crtcs, sizeof(*crtc_ids));
-  res.connector_id_ptr = (uint64_t)(uintptr_t)conn_ids;
+  fb_ids = calloc(res.count_fbs ? res.count_fbs : 1, sizeof(*fb_ids));
+  enc_ids = calloc(res.count_encoders ? res.count_encoders : 1,
+                   sizeof(*enc_ids));
+  res.fb_id_ptr = (uint64_t)(uintptr_t)fb_ids;
   res.crtc_id_ptr = (uint64_t)(uintptr_t)crtc_ids;
+  res.connector_id_ptr = (uint64_t)(uintptr_t)conn_ids;
+  res.encoder_id_ptr = (uint64_t)(uintptr_t)enc_ids;
   if (drm_ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &res) < 0) {
     perror("MODE_GETRESOURCES (fill)");
     return 1;
@@ -150,6 +176,12 @@ int main(int argc, char **argv)
   conn.encoders_ptr = (uint64_t)(uintptr_t)
                       calloc(conn.count_encoders ? conn.count_encoders : 1,
                              sizeof(uint32_t));
+  conn_props = calloc(conn.count_props ? conn.count_props : 1,
+                      sizeof(*conn_props));
+  conn_prop_values = calloc(conn.count_props ? conn.count_props : 1,
+                            sizeof(*conn_prop_values));
+  conn.props_ptr = (uint64_t)(uintptr_t)conn_props;
+  conn.prop_values_ptr = (uint64_t)(uintptr_t)conn_prop_values;
   if (drm_ioctl(fd, DRM_IOCTL_MODE_GETCONNECTOR, &conn) < 0) {
     perror("MODE_GETCONNECTOR (fill)");
     return 1;
@@ -159,6 +191,8 @@ int main(int argc, char **argv)
     fprintf(stderr, "No mode on connector %u\n", connector_id);
     return 1;
   }
+  free(conn_props);
+  free(conn_prop_values);
 
   /* pick the CRTC through the encoder's possible_crtcs mask */
   encoder_id = ((uint32_t *)conn.encoders_ptr)[0];
@@ -222,6 +256,30 @@ int main(int argc, char **argv)
   }
   for (i = 0; i < (int)(dumb.size / 2); i++)
     pixels[i] = 0xf800; /* solid red RGB565 */
+
+  /*
+   * Dumb buffers are allocated with dma_alloc_wc(), i.e. write-combined
+   * memory. WC stores sit in the CPU's write-combining buffer and are not
+   * guaranteed to be visible to the kernel's uncached reads at commit
+   * time, so drain them before submitting the atomic commit.
+   */
+  __sync_synchronize();
+#if defined(__x86_64__) || defined(__i386__)
+  /*
+   * If the kernel's vaddr mapping is cacheable while ours is write-combined,
+   * the WC stores bypass the kernel's stale cache lines. CLFLUSH evicts
+   * those lines so the kernel's next read fetches the drained data.
+   */
+  {
+    unsigned char *flush = (unsigned char *)pixels;
+    size_t n;
+
+    for (n = 0; n < dumb.size; n += 64)
+      _mm_clflush(flush + n);
+  }
+#endif
+  printf("filled: userspace readback pixel[0][0]=0x%04x\n", pixels[0]);
+
   munmap(pixels, dumb.size);
 
   plane_fb_prop = find_prop_id(fd, plane_id, DRM_MODE_OBJECT_PLANE, "FB_ID");

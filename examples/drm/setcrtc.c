@@ -75,7 +75,10 @@ int main(int argc, char **argv)
   struct drm_mode_fb_cmd2 fb = { 0 };
   struct drm_mode_map_dumb map = { 0 };
   struct drm_mode_crtc set = { 0 };
+  uint32_t *fb_ids, *crtc_ids, *conn_ids, *enc_ids;
   uint32_t connector_id, crtc_id;
+  uint32_t *props = NULL;
+  uint64_t *prop_values = NULL;
   uint16_t *pixels;
   int fd;
 
@@ -98,8 +101,22 @@ int main(int argc, char **argv)
     return 1;
   }
 
-  connector_id = ((uint32_t *)res.connector_id_ptr)[0];
-  crtc_id = ((uint32_t *)res.crtc_id_ptr)[0];
+  fb_ids = calloc(res.count_fbs ? res.count_fbs : 1, sizeof(*fb_ids));
+  crtc_ids = calloc(res.count_crtcs ? res.count_crtcs : 1, sizeof(*crtc_ids));
+  conn_ids = calloc(res.count_connectors ? res.count_connectors : 1,
+                    sizeof(*conn_ids));
+  enc_ids = calloc(res.count_encoders ? res.count_encoders : 1,
+                   sizeof(*enc_ids));
+  res.fb_id_ptr = (uint64_t)(uintptr_t)fb_ids;
+  res.crtc_id_ptr = (uint64_t)(uintptr_t)crtc_ids;
+  res.connector_id_ptr = (uint64_t)(uintptr_t)conn_ids;
+  res.encoder_id_ptr = (uint64_t)(uintptr_t)enc_ids;
+  if (drm_ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &res) < 0) {
+    perror("MODE_GETRESOURCES (fill)");
+    return 1;
+  }
+  connector_id = conn_ids[0];
+  crtc_id = crtc_ids[0];
 
   conn.connector_id = connector_id;
   if (drm_ioctl(fd, DRM_IOCTL_MODE_GETCONNECTOR, &conn) < 0) {
@@ -112,6 +129,11 @@ int main(int argc, char **argv)
   conn.encoders_ptr = (uint64_t)(uintptr_t)
                       calloc(conn.count_encoders ? conn.count_encoders : 1,
                              sizeof(uint32_t));
+  props = calloc(conn.count_props ? conn.count_props : 1, sizeof(*props));
+  prop_values = calloc(conn.count_props ? conn.count_props : 1,
+                       sizeof(*prop_values));
+  conn.props_ptr = (uint64_t)(uintptr_t)props;
+  conn.prop_values_ptr = (uint64_t)(uintptr_t)prop_values;
   if (drm_ioctl(fd, DRM_IOCTL_MODE_GETCONNECTOR, &conn) < 0) {
     perror("MODE_GETCONNECTOR (fill)");
     return 1;
@@ -121,6 +143,8 @@ int main(int argc, char **argv)
     fprintf(stderr, "No mode on connector %u\n", connector_id);
     return 1;
   }
+  free(props);
+  free(prop_values);
 
   dumb.width = mode->hdisplay;
   dumb.height = mode->vdisplay;

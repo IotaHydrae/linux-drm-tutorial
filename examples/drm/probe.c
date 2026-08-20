@@ -41,6 +41,8 @@ static void print_connector(int fd, uint32_t id)
 {
   struct drm_mode_get_connector conn = { .connector_id = id };
   uint32_t *encoders = NULL;
+  uint32_t *props = NULL;
+  uint64_t *prop_values = NULL;
   struct drm_mode_modeinfo *modes = NULL;
   int i;
 
@@ -51,8 +53,13 @@ static void print_connector(int fd, uint32_t id)
   encoders = calloc(conn.count_encoders ? conn.count_encoders : 1,
                     sizeof(*encoders));
   modes = calloc(conn.count_modes ? conn.count_modes : 1, sizeof(*modes));
+  props = calloc(conn.count_props ? conn.count_props : 1, sizeof(*props));
+  prop_values = calloc(conn.count_props ? conn.count_props : 1,
+                       sizeof(*prop_values));
   conn.encoders_ptr = (uint64_t)(uintptr_t)encoders;
   conn.modes_ptr = (uint64_t)(uintptr_t)modes;
+  conn.props_ptr = (uint64_t)(uintptr_t)props;
+  conn.prop_values_ptr = (uint64_t)(uintptr_t)prop_values;
   if (drm_ioctl(fd, DRM_IOCTL_MODE_GETCONNECTOR, &conn) < 0) {
     perror("MODE_GETCONNECTOR (fill)");
     goto out;
@@ -62,13 +69,16 @@ static void print_connector(int fd, uint32_t id)
          conn.connector_id, conn.connector_type, conn.connection);
   for (i = 0; i < (int)conn.count_encoders; i++)
     printf(" %u", encoders[i]);
-  printf(" mode_count=%u\n", conn.count_modes);
+  printf(" mode_count=%u prop_count=%u\n", conn.count_modes,
+         conn.count_props);
   for (i = 0; i < (int)conn.count_modes; i++)
     print_mode(&modes[i]);
 
 out:
   free(encoders);
   free(modes);
+  free(props);
+  free(prop_values);
 }
 
 static void print_encoder(int fd, uint32_t id)
@@ -132,6 +142,10 @@ static void print_planes(int fd)
 int main(int argc, char **argv)
 {
   const char *dev = argc > 1 ? argv[1] : "/dev/dri/card0";
+  struct drm_set_client_cap cap = {
+    .capability = DRM_CLIENT_CAP_UNIVERSAL_PLANES,
+    .value = 1,
+  };
   struct drm_mode_card_res res = { 0 };
   uint32_t *fb_ids, *crtc_ids, *conn_ids, *enc_ids;
   int fd, i;
@@ -141,6 +155,10 @@ int main(int argc, char **argv)
     perror(dev);
     return 1;
   }
+
+  /* primary planes are hidden unless this capability is set */
+  if (drm_ioctl(fd, DRM_IOCTL_SET_CLIENT_CAP, &cap) < 0)
+    perror("SET_CLIENT_CAP (ignored)");
 
   if (drm_ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &res) < 0) {
     perror("MODE_GETRESOURCES");
