@@ -19,6 +19,7 @@
 #include <drm/drm_gem_framebuffer_helper.h>
 #include <drm/drm_gem_atomic_helper.h>
 #include <drm/drm_damage_helper.h>
+#include <drm/drm_framebuffer.h>
 
 struct drm_tutorial {
 	struct drm_device *drm;
@@ -67,22 +68,56 @@ drm_tutorial_plane_helper_atomic_update(struct drm_plane *plane,
 {
 	struct drm_plane_state *plane_state = plane->state;
 	struct drm_framebuffer *fb = plane_state->fb;
-	struct drm_plane_state *old_plane_state =
-		drm_atomic_get_old_plane_state(state, plane);
+	struct drm_plane_state *old_plane_state;
+	struct drm_gem_dma_object *dma_obj;
+	struct drm_gem_object *obj;
 	struct drm_rect rect;
+	void *vaddr;
+	u16 *pixels;
+	int x, y;
 	int idx;
 
 	if (!fb)
 		return;
 
-	if (drm_dev_enter(plane->dev, &idx)) {
-		if (drm_atomic_helper_damage_merged(old_plane_state,
-						    plane_state, &rect))
-			printk("%s, x1 : %u, y1 : %u, x2 : %u, y2 : %u\n",
-			       __func__, rect.x1, rect.y1, rect.x2, rect.y2);
+	old_plane_state = drm_atomic_get_old_plane_state(state, plane);
 
-		drm_dev_exit(idx);
+	if (!drm_dev_enter(plane->dev, &idx))
+		return;
+
+	/* framebuffer -> GEM object */
+	obj = fb->obj[0];
+
+	/* GEM object -> DMA GEM object */
+	dma_obj = to_drm_gem_dma_obj(obj);
+
+	/* DMA GEM object -> CPU virtual address */
+	vaddr = dma_obj->vaddr;
+	if (!vaddr)
+		goto out;
+
+	pr_info("%s: fb=%u %ux%u pitch=%u vaddr=%p\n", __func__, fb->base.id,
+		fb->width, fb->height, fb->pitches[0], vaddr);
+
+	/* Dump x(0 ~ 15) pixels data */
+	pixels = (u16 *)vaddr;
+	for (y = 0; y < 4; y++) {
+		for (x = 0; x < 4; x++) {
+			u16 pixel;
+
+			pixel = pixels[y * (fb->pitches[0] / 2) + x];
+
+			pr_info("pixel_x|y:[%02d][%02d] = 0x%04x\n", x, y,
+				pixel);
+		}
 	}
+
+	if (drm_atomic_helper_damage_merged(old_plane_state, plane_state,
+					    &rect))
+		printk("%s, x1 : %u, y1 : %u, x2 : %u, y2 : %u\n", __func__,
+		       rect.x1, rect.y1, rect.x2, rect.y2);
+out:
+	drm_dev_exit(idx);
 }
 
 static const struct drm_plane_helper_funcs drm_tutorial_plane_helper_funcs = {
