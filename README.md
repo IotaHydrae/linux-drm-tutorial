@@ -556,6 +556,33 @@ insmod drm-tutorial.ko
   delegates to `drm_crtc_helper_mode_valid_fixed()` (returns `MODE_OK` for
   128x160, `MODE_ONE_WIDTH` / `MODE_ONE_HEIGHT` / `MODE_ONE_SIZE` otherwise).
 
+Sequence diagram: module load → probe → `/dev/dri/card0` (the fbdev half
+continues in section 3):
+
+```text
+module init          platform core       drm_tutorial_probe    DRM core
+    │                     │                      │                 │
+    │ platform_device_register_simple()          │                 │
+    │────────────────────▶│                      │                 │
+    │ platform_driver_register()                 │                 │
+    │────────────────────▶│                      │                 │
+    │                     │ probe("drm_tutorial")│                 │
+    │                     │─────────────────────▶│                 │
+    │                     │                      │ drm_dev_alloc() │
+    │                     │                      │────────────────▶│
+    │                     │                      │ mode_config_init│
+    │                     │                      │────────────────▶│
+    │                     │                      │ create plane,   │
+    │                     │                      │ crtc, encoder,  │
+    │                     │                      │ connector       │
+    │                     │                      │────────────────▶│
+    │                     │                      │ attach + reset  │
+    │                     │                      │ drm_dev_register│
+    │                     │                      │────────────────▶│
+    │                     │                      │ drm_client_setup│ → /dev/fb0 (section 3)
+    │                     │                      │────────────────▶│
+```
+
 #### 3. The fbdev emulation bootstrap (`drm_client_setup()` → `/dev/fb0`)
 
 ```text
@@ -625,6 +652,34 @@ Note that the *shadowed* fbdev path is taken only because the framebuffer was
 created through `drm_gem_fb_create_with_dirty` (i.e. `fb->funcs->dirty` is
 set). That is the reason the driver deliberately registers
 `.fb_create = drm_gem_fb_create_with_dirty` in its mode config.
+
+Sequence diagram: from `drm_client_setup()` to `/dev/fb0` and the first
+modeset:
+
+```text
+ fbdev client        fb helper           client modeset      connector           fbdev probe         fbcon / atomic
+ (client_setup)      (initial_config)    (modeset_probe)     (.get_modes)        (dma probe)         (commit)
+      │                    │                    │                   │                   │                   │
+      │ drm_fbdev_client_setup()               │                   │                   │                   │
+      │───────────────────▶│                    │                   │                   │                   │
+      │                    │ hotplug → initial_config()           │                   │                   │
+      │                    │───────────────────▶│                   │                   │                   │
+      │                    │                    │ fill_modes()      │                   │                   │
+      │                    │                    │──────────────────▶│                   │                   │
+      │                    │                    │                   │ get_modes_fixed() │                   │
+      │                    │                    │                   │ (128x160 added)   │                   │
+      │                    │                    │ validate + pick_crtcs()              │                   │
+      │                    │ single_fb_probe()  │                   │                   │                   │
+      │                    │───────────────────────────────────────────────────────────▶│                   │
+      │                    │                    │                   │                   │ fb_create → GEM   │
+      │                    │                    │                   │                   │ shadow + defio    │
+      │                    │ register_framebuffer()                │                   │                   │
+      │                    │───────────────────────────────────────────────────────────▶│                   │
+      │                    │                    │                   │                   │ /dev/fb0 created  │
+      │                    │                    │                   │                   │ fbcon: set_par()  │
+      │                    │                    │                   │                   │──────────────────▶│
+      │                    │                    │                   │                   │                   │ atomic_commit → atomic_update()
+```
 
 #### 4. A user write to `/dev/fb0`, end to end
 
@@ -714,6 +769,40 @@ then accumulates the dirty rectangle and, on flush, blits the affected region
 into the real GEM buffer and triggers one atomic commit carrying the damage
 clip as the plane's `FB_DAMAGE_CLIPS` property.
 
+Sequence diagram: one `write()` → `drm_tutorial_plane_helper_atomic_update()`:
+
+```text
+ userspace            fbdev core            damage worker         DRM core              driver hooks
+ (tests)              (fbmem/fb_ops)        (workqueue)          (dirtyfb/atomic)      (drm.c)
+      │                    │                      │                    │                    │
+      │ write(2)           │                      │                    │                    │
+      │───────────────────▶│                      │                    │                    │
+      │                    │ fb_sys_write()       │                    │                    │
+      │                    │ (→ shadow buffer)    │                    │                    │
+      │                    │ damage_range()       │                    │                    │
+      │                    │─────────────────────▶│                    │                    │
+      │                    │                      │ merge clip;        │                    │
+      │                    │                      │ schedule_work()    │                    │
+      │                    │                      │                    │                    │
+      │                    │                      │ damage_work()      │                    │
+      │                    │                      │───────────────────▶│                    │
+      │                    │                      │                    │ damage_blit:       │
+      │                    │                      │                    │ shadow → GEM       │
+      │                    │                      │ dirtyfb()          │                    │
+      │                    │                      │───────────────────▶│                    │
+      │                    │                      │                    │ atomic_commit()    │
+      │                    │                      │                    │──────────────────▶│
+      │                    │                      │                    │                    │ atomic_check()
+      │                    │                      │                    │◀───────────────────│
+      │                    │                      │                    │ atomic_update()    │
+      │                    │                      │                    │──────────────────▶│
+      │                    │                      │                    │                    │ (log damage rect)
+```
+
+The `mmap()` path used by the tests skips `write(2)` and enters at
+`fb_deferred_io_fault()`; everything from `damage_range()` onward is the
+same.
+
 #### 5. The atomic commit machinery
 
 ```text
@@ -773,6 +862,36 @@ Two details worth noticing:
 - The `begin_fb_access` / `end_fb_access` shadow helpers bracket the update:
   `drm_gem_begin_shadow_fb_access()` vmaps the framebuffer objects into kernel
   address space, and `drm_gem_end_shadow_fb_access()` unmaps them again.
+
+Sequence diagram: the phases of one blocking atomic commit:
+
+```text
+ DRM core              atomic helpers         plane (driver)         crtc (driver)
+ (drm_atomic.c)        (drm_atomic_helper.c)  (drm.c)                (drm.c)
+      │                      │                      │                      │
+      │ drm_atomic_check_only()                    │                      │
+      │─────────────────────▶│                      │                      │
+      │                      │ atomic_check()       │                      │
+      │                      │─────────────────────▶│                      │
+      │                      │ atomic_check()       │                      │
+      │                      │────────────────────────────────────────────▶│
+      │ drm_atomic_helper_commit()                 │                      │
+      │─────────────────────▶│                      │                      │
+      │                      │ prepare_planes()     │                      │
+      │                      │  begin_fb_access()   │                      │
+      │                      │─────────────────────▶│ (vmap)               │
+      │                      │ swap_state()         │                      │
+      │                      │ commit_tail()        │                      │
+      │                      │  commit_planes()     │                      │
+      │                      │   atomic_update()    │                      │
+      │                      │─────────────────────▶│ (log damage)         │
+      │                      │   end_fb_access()    │                      │
+      │                      │─────────────────────▶│ (vunmap)             │
+      │                      │  modeset_enables()   │                      │
+      │                      │   atomic_enable()    │                      │
+      │                      │────────────────────────────────────────────▶│ (log)
+      │                      │  cleanup_planes()    │                      │
+```
 
 #### 6. Inside `drm_tutorial_plane_helper_atomic_update()`
 
