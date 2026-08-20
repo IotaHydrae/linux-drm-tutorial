@@ -158,6 +158,8 @@ pipeline as `/dev/fb0`. This section is written as a tour:
   order, what happens when a user writes pixels to the framebuffer;
 - sections 5-7 look at the atomic commit machinery, the driver's
   `atomic_update()` callback, and answer common beginner questions.
+- the "DRM ioctls in practice" chapter below shows the same callbacks from
+  userspace: `modetest` one-liners and raw-ioctl example programs.
 
 All function names can be looked up in the kernel source used to build this
 module (`~/microsoft/WSL2-Linux-Kernel`, i.e. the `KDIR` from the Makefile).
@@ -973,6 +975,91 @@ To follow the call chains in the real kernel source:
 | atomic helpers (check/commit/planes) | `drivers/gpu/drm/drm_atomic_helper.c` |
 | shadow plane helpers | `drivers/gpu/drm/drm_gem_atomic_helper.c`, `drm_gem_framebuffer_helper.c` |
 | object registration (plane/CRTC/encoder/connector) | `drivers/gpu/drm/drm_plane.c`, `drm_crtc.c`, `drm_encoder.c`, `drm_connector.c` |
+| ioctl dispatch table | `drivers/gpu/drm/drm_ioctl.c` |
+| atomic ioctl handler, dumb buffers | `drivers/gpu/drm/drm_atomic_uapi.c`, `drm_dumb_buffers.c` |
+
+## DRM ioctls in practice
+
+Everything in the previous sections happens behind ioctls. There are two
+ways to exercise them: `modetest` (from libdrm, no code to write) and the
+small raw-ioctl programs in `examples/drm/`.
+
+### modetest: poke the driver without writing code
+
+```bash
+sudo apt install libdrm-tools   # provides modetest
+
+modetest -M drm_tutorial -c   # connectors and their modes (GETCONNECTOR)
+modetest -M drm_tutorial -e   # encoders                  (GETENCODER)
+modetest -M drm_tutorial -p   # planes                    (GETPLANERESOURCES / GETPLANE)
+modetest -M drm_tutorial -s 32:128x160          # legacy modeset (SETCRTC)
+modetest -M drm_tutorial -a -s 32@33:128x160    # atomic modeset (MODE_ATOMIC)
+```
+
+The connector and CRTC IDs (here 32 and 33) come from the `-c` output; mode
+syntax details are in `modetest -h`. `make test` already uses the `-e`
+variant. A successful modeset shows up in dmesg as `atomic_check` →
+`atomic_update` → `atomic_enable` - the same callbacks as the fbdev writes.
+
+### The ioctl → driver callback map
+
+| ioctl | kernel handler | reaches the driver via |
+| ----- | -------------- | ---------------------- |
+| `MODE_GETRESOURCES` | `drm_mode_getresources` | core object lists (no driver code) |
+| `MODE_GETCONNECTOR` | `drm_mode_getconnector` | `connector->funcs->fill_modes` → `.get_modes` (`drm_connector_helper_get_modes_fixed`) → CRTC `.mode_valid` (`drm_crtc_helper_mode_valid_fixed`) |
+| `MODE_GETENCODER` | `drm_mode_getencoder` | core object metadata |
+| `MODE_GETPLANERESOURCES` / `MODE_GETPLANE` | `drm_mode_getplane_res` / `drm_mode_getplane` | core object metadata |
+| `MODE_CREATE_DUMB` | `drm_mode_create_dumb_ioctl` | `driver->dumb_create = drm_gem_dma_dumb_create` |
+| `MODE_ADDFB2` | `drm_mode_addfb2_ioctl` | `mode_config.funcs->fb_create = drm_gem_fb_create_with_dirty` |
+| `MODE_MAP_DUMB` | `drm_mode_mmap_dumb` | GEM DMA mmap |
+| `MODE_SETCRTC` | `drm_mode_setcrtc` → `drm_mode_set_config_internal` | `crtc->funcs->set_config = drm_atomic_helper_set_config` → `drm_atomic_commit` → check/commit |
+| `MODE_ATOMIC` | `drm_mode_atomic_ioctl` | `drm_atomic_commit` → same check/commit path |
+
+The last two rows are the punchline: both the legacy `SETCRTC` ioctl and the
+modern atomic ioctl funnel into the exact same machinery described in
+section 5 of "How it works".
+
+### The example programs
+
+The programs in `examples/drm/` use only the raw `ioctl()` syscall - no
+libdrm. They need the kernel UAPI headers (`sudo apt install libdrm-dev`
+provides `/usr/include/drm/drm.h`):
+
+```bash
+make -C examples/drm
+sudo ./examples/drm/probe.out
+sudo ./examples/drm/setcrtc.out
+sudo ./examples/drm/atomic.out
+```
+
+**`probe.out`** performs `GETRESOURCES`, then `GETCONNECTOR` / `GETENCODER` /
+`GETPLANE` for every object and prints the IDs and modes. Run it first - the
+printed IDs are what the other tools expect. It is also a good way to see
+that `GETCONNECTOR` goes through `fill_modes`: with the tutorial driver you
+get exactly one 128x160 mode, marked `(preferred)`.
+
+**`setcrtc.out`** drives the legacy path: create a 16 bpp dumb buffer
+(`CREATE_DUMB`), attach it as an RGB565 framebuffer (`ADDFB2`), fill it with
+a gradient through `MAP_DUMB` + `mmap`, then call `SETCRTC` with the
+connector and the mode. In dmesg you should see `atomic_check`,
+`atomic_update` and `atomic_enable` - proof that the legacy ioctl is
+translated into an atomic commit.
+
+**`atomic.out`** demonstrates the modern API:
+
+1. discover the property IDs (`FB_ID`, `CRTC_ID`, `MODE_ID`, `ACTIVE`) with
+   `MODE_OBJ_GETPROPERTIES` + `MODE_GETPROPERTY`;
+2. create a mode blob (`CREATEPROPBLOB`) containing the 128x160
+   `drm_mode_modeinfo`;
+3. submit one atomic state for the plane, CRTC and connector, first with
+   `DRM_MODE_ATOMIC_TEST_ONLY` - dmesg shows `atomic_check` only, nothing is
+   programmed;
+4. then submit the real commit - dmesg now also shows `atomic_update`, and
+   because the buffer was filled with `0xf800` (red), the driver's 4x4 pixel
+   dump prints `0xf800` values.
+
+Note: `SETCRTC` and `MODE_ATOMIC` need DRM master, which is why the programs
+call `DRM_IOCTL_SET_MASTER` (root, and no compositor holding the device).
 
 ## Kernel debugging tips
 
