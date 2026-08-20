@@ -1,0 +1,55 @@
+#!/bin/bash
+# ga - Resolve a symbol+offset to source code line using addr2line
+# Usage: ga <vmlinux_path> <symbol+offset>
+# Example: ga /path/to/vmlinux drm_atomic_connector_get_property+0x1a3
+# Output: only the first line of addr2line result (to avoid inline expansions)
+
+if [ $# -ne 2 ]; then
+    echo "Usage: $0 <vmlinux_path> <symbol+offset>"
+    echo "Example: $0 /path/to/vmlinux symbol+0x123"
+    exit 1
+fi
+
+vmlinux="$1"
+symoff="$2"
+
+if [ ! -f "$vmlinux" ]; then
+    echo "Error: vmlinux file '$vmlinux' not found." >&2
+    exit 1
+fi
+
+# Extract symbol and offset using awk (splits on '+')
+symbol=$(echo "$symoff" | awk -F '+' '{print $1}')
+offset_str=$(echo "$symoff" | awk -F '+' '{print $2}')
+
+if [ -z "$symbol" ] || [ -z "$offset_str" ]; then
+    echo "Error: Invalid symbol+offset format. Expected 'symbol+offset'." >&2
+    exit 1
+fi
+
+# Parse offset: if starts with 0x then hex, else decimal
+if [[ "$offset_str" =~ ^0x[0-9a-fA-F]+$ ]]; then
+    offset=$(( offset_str ))
+elif [[ "$offset_str" =~ ^[0-9]+$ ]]; then
+    offset=$(( offset_str ))
+else
+    echo "Error: Invalid offset '$offset_str'. Should be decimal or hex (0x...)" >&2
+    exit 1
+fi
+
+# Find address of symbol (excluding symbols starting with "__")
+addr_hex=$(nm "$vmlinux" | awk -v sym="$symbol" '
+    $NF == sym && substr($NF,1,2) != "__" {print $1; exit}
+')
+if [ -z "$addr_hex" ]; then
+    echo "Error: Could not find symbol '$symbol' (non-__) in $vmlinux." >&2
+    exit 1
+fi
+
+# Convert hex address to decimal, add offset, then back to hex
+addr_dec=$(( 16#$addr_hex ))
+final_dec=$(( addr_dec + offset ))
+printf -v final_hex "0x%x" $final_dec
+
+# Run addr2line and keep only the first line (ignore inline expansions)
+addr2line -e "$vmlinux" -i "$final_hex" | head -1

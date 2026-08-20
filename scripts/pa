@@ -1,0 +1,70 @@
+#!/bin/bash
+
+# pa - Print 8 lines before and after a given line number, with the center line highlighted in red
+# Usage: pa <file_path:line_number>
+# Example: pa /home/developer/microsoft/WSL2-Linux-Kernel/drivers/gpu/drm/drm_atomic_uapi.c:808
+# 800             struct drm_property *property, uint64_t *val)
+# 801 {
+# 802     struct drm_device *dev = connector->dev;
+# 803     struct drm_mode_config *config = &dev->mode_config;
+# 804
+# 805     if (property == config->prop_crtc_id) {
+# 806             *val = (state->crtc) ? state->crtc->base.id : 0;
+# 807     } else if (property == config->dpms_property) {
+# 808             if (state->crtc && state->crtc->state->self_refresh_active)
+# 809                     *val = DRM_MODE_DPMS_ON;
+# 810             else
+# 811                     *val = connector->dpms;
+# 812     } else if (property == config->tv_select_subconnector_property) {
+# 813             *val = state->tv.select_subconnector;
+# 814     } else if (property == config->tv_subconnector_property) {
+# 815             *val = state->tv.subconnector;
+# 816     } else if (property == config->tv_left_margin_property) {
+
+if [ $# -lt 1 ] || [ $# -gt 2 ]; then
+    echo "Usage: $0 <file_path:line_number> [context_lines]"
+    echo "  context_lines: number of lines before/after (default 8)"
+    echo "Example: $0 /path/to/file:1234 16"
+    exit 1
+fi
+
+input="$1"
+context=${2:-8}   # default to 8 if not provided
+
+# Validate context is a positive integer
+if ! [[ "$context" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Error: context_lines must be a positive integer." >&2
+    exit 1
+fi
+
+# Extract line number (digits at the end)
+line=$(echo "$input" | grep -oE '[0-9]+$')
+# Extract file path (remove the trailing ':number')
+file=$(echo "$input" | sed 's/:[0-9]*$//')
+
+# Validate extraction
+if [ -z "$line" ] || [ -z "$file" ]; then
+    echo "Error: Invalid format. Expected 'file_path:line_number'." >&2
+    exit 1
+fi
+
+# Check if file exists and is readable
+if [ ! -f "$file" ]; then
+    echo "Error: File '$file' does not exist or is not readable." >&2
+    exit 1
+fi
+
+# Calculate range
+start=$((line - context))
+end=$((line + context))
+[ $start -lt 1 ] && start=1
+
+# Print lines with center line highlighted in red
+awk -v s="$start" -v e="$end" -v center="$line" '
+    NR>=s && NR<=e {
+        if (NR == center)
+            printf "\033[31m%s %s\033[0m\n", NR, $0
+        else
+            print NR, $0
+    }
+' "$file"
