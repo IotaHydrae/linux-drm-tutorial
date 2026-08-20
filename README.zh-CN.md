@@ -2,26 +2,23 @@
 
 # Linux DRM 驱动教程
 
-一个为 Linux 编写的最小原子 KMS 驱动，以 out-of-tree 模块的形式构建，并通过
-WSL2 或 QEMU 下的 framebuffer 实际运行验证。驱动把一条固定模式的
-CRTC/plane/encoder/connector 流水线接入 DRM，再通过 fbdev 模拟把显示输出暴露
-给用户态。
+一个为 Linux 编写的最小原子 KMS 驱动，以 out-of-tree 内核模块构建，在 WSL2 或
+QEMU 下运行。驱动组装一条固定 128x160 的 plane → CRTC → encoder → connector
+流水线，通过 fbdev 模拟把显示输出暴露成 `/dev/fb0`，并把原子提交的每个阶段都
+打印进 dmesg——从用户态写一个像素开始，你能在内核日志里看到整条 DRM 数据链路，
+一直到 `drm_tutorial_plane_helper_atomic_update()`。
 
 ```
-               DRM device
-                   │
-    ┌──────────────┴──────────────┐
-    │                             │
-Connector                        CRTC
-    │                             │
- Encoder                     Primary Plane
-                                  │
-                                  │
-                             Framebuffer
-                                  │
-                                  │
-                               GEM DMA
+          像素扫描输出路径（左 → 右）
+
+┌────────────┐──▶┌────────────┐──▶┌────────────┐──▶┌────────────┐──▶┌────────────┐──▶┌────────────┐
+│  GEM DMA   │   │ framebuffer│   │   plane    │   │    CRTC    │   │  encoder   │   │ connector  │
+│   pixels   │   │   RGB565   │   │ (primary)  │   │  128x160   │   │   no-op    │   │  128x160   │
+└────────────┘   └────────────┘   └────────────┘   └────────────┘   └────────────┘   └────────────┘
 ```
+
+模式反向流动：connector 的 `get_modes` 产生 128x160 模式，CRTC 负责校验
+（`drm_crtc_helper_mode_valid_fixed`）。
 
 ## 环境
 

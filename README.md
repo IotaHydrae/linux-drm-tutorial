@@ -2,26 +2,25 @@
 
 # Linux DRM driver tutorial
 
-A minimal atomic KMS driver for Linux, built as an out-of-tree module and
-exercised through a framebuffer under WSL2 or QEMU. The driver wires a
-fixed-mode CRTC/plane/encoder/connector pipeline into DRM, then exposes it to
-userspace via fbdev emulation.
+A minimal atomic KMS driver for Linux, built as an out-of-tree kernel module
+and run on WSL2 or under QEMU. The driver assembles a fixed 128x160
+plane → CRTC → encoder → connector pipeline, exposes it to user space as
+`/dev/fb0` through fbdev emulation, and logs every stage of the atomic commit
+in dmesg — so you can write a pixel from user space and watch the whole DRM
+data path, down to `drm_tutorial_plane_helper_atomic_update()`, in the kernel
+log.
 
 ```
-               DRM device
-                   │
-    ┌──────────────┴──────────────┐
-    │                             │
-Connector                        CRTC
-    │                             │
- Encoder                     Primary Plane
-                                  │
-                                  │
-                             Framebuffer
-                                  │
-                                  │
-                               GEM DMA
+          pixel scanout path (left → right)
+
+┌────────────┐──▶┌────────────┐──▶┌────────────┐──▶┌────────────┐──▶┌────────────┐──▶┌────────────┐
+│  GEM DMA   │   │ framebuffer│   │   plane    │   │    CRTC    │   │  encoder   │   │ connector  │
+│   pixels   │   │   RGB565   │   │ (primary)  │   │  128x160   │   │   no-op    │   │  128x160   │
+└────────────┘   └────────────┘   └────────────┘   └────────────┘   └────────────┘   └────────────┘
 ```
+
+Modes flow the other way: the connector's `get_modes` produces the 128x160
+mode and the CRTC validates it (`drm_crtc_helper_mode_valid_fixed`).
 
 ## Environment
 
