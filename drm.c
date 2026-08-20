@@ -420,6 +420,7 @@ static void drm_tutorial_remove(struct platform_device *pdev)
 
 	drm_dev_unplug(dev->drm);
 	drm_atomic_helper_shutdown(dev->drm);
+	drm_dev_put(dev->drm);
 }
 
 static struct platform_driver drm_tutorial_platform_driver = {
