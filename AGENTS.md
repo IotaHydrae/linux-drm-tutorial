@@ -1,45 +1,80 @@
 # Repository Guidelines
 
-## Project Structure & Module Organization
+> General knowledge-base, oracle, CLI and exit-code conventions live in the
+> workspace [AGENTS.md](../AGENTS.md). This file only records what is specific
+> to `linux-drm-tutorial`.
 
-- `drm.c` + `Makefile` — the out-of-tree DRM/KMS kernel module (`obj-m += drm-tutorial.o`, `drm-tutorial-objs := drm.o`).
-- `tests/` — user-space framebuffer programs (`fb_fill`, `fb_pixel_set`, `fb_rectangle`); every `*.c` builds to a matching `.out`.
-- `examples/drm/` — raw DRM-ioctl demos (`probe`, `setcrtc`, `atomic`) with no libdrm dependency.
-- `scripts/` — kernel debugging helpers: `ga` (symbol+offset to source line), `pa` (print context around `file:line`).
+## Project structure
+
+- `drm.c` + `Makefile` — the out-of-tree DRM/KMS kernel module
+  (`obj-m += drm-tutorial.o`, `drm-tutorial-objs := drm.o`). `drm.c` is the only
+  kernel source file.
+- `tests/` — user-space framebuffer tests (`test_fb_*`) plus shared helpers in
+  `tests/common/`, and the offline host tests (`test_*_{abi,uapi,build,cli}.py`).
+  See [tests/README.md](tests/README.md) for the oracle of each test.
+- `examples/drm/` — raw DRM-ioctl demos (`probe`, `setcrtc`, `atomic`) with no
+  libdrm dependency.
+- `scripts/` — kernel debugging helpers: `ga` (symbol+offset to source line),
+  `pa` (print context around `file:line`).
 - `tools/` — `fbview.py`, a live framebuffer viewer.
-- `README.md` / `README.zh-CN.md` — English and Simplified Chinese docs; keep both in sync.
+- `docs/` — the split knowledge base (design documents). `docs/README.md` is the
+  index; every document has a `.zh-CN.md` mirror.
+- `README.md` / `README.zh-CN.md` — build/run docs plus a documentation index;
+  keep the two in sync.
 
-## Build, Test, and Development Commands
+## Architecture invariants
 
-- `make` — build the kernel module against `KDIR` (default `/lib/modules/$(uname -r)/build`).
-- `make test` — rebuild, `rmmod`/`insmod` the module, then dump modes with `modetest -e`.
-- `make -C tests` — build the framebuffer test binaries.
-- `make -C examples/drm` — build the DRM ioctl demos (requires `/usr/include/drm/drm.h`).
-- Run tests manually: `sudo ./tests/fb_fill.out f800` fills `/dev/fb0`; `sudo ./examples/drm/probe.out /dev/dri/cardN` enumerates objects.
-- Verify in dmesg: `drm_tutorial_plane_helper_atomic_update: fb=...` logs the merged damage rect and the top-left 4x4 pixels.
+- Minimal atomic KMS platform driver: fixed **128x160** mode, **RGB565** primary
+  plane with fb damage clips, GEM DMA buffers, fbdev emulation via
+  `drm_client_setup()`. These values come from `drm.c` and are what the tests
+  assert; if `drm.c` changes, update the tests and the docs together.
+- Write path: `/dev/fb0` write → shadow buffer → damage worker →
+  `drm_atomic_helper_dirtyfb` → `drm_atomic_commit` →
+  `drm_tutorial_plane_helper_atomic_update()`. The callback tables in
+  `docs/kms-objects.md` are transcribed from `drm.c`; treat `drm.c` as the
+  authority.
+- `drm.c` is kernel code. Keep it in kernel style (tabs, 8 columns) and do not
+  modify it for test convenience; report suspected bugs instead of patching them
+  as part of a test change.
 
-## Coding Style & Naming Conventions
+## Build, test and development commands
 
-- Kernel code (`drm.c`): kernel style — tabs (8 columns), `drm_tutorial_*` symbol prefix, kernel-style `.clang-format`/`.clangd` at the repo root.
+```bash
+make                    # build the module against KDIR
+make KDIR=/path/to/build
+make -C tests           # build the C framebuffer tests
+make -C tests check-offline   # host-only tests, no module, no /dev/fb*
+make -C examples/drm    # build the DRM ioctl demos (needs /usr/include/drm/drm.h)
+make check              # offline checks only
+```
+
+- `KDIR` defaults to `/lib/modules/$(uname -r)/build`.
+- `make test` rebuilds, `rmmod`/`insmod`s the module and dumps modes with
+  `modetest -e`. It changes the running kernel — run it only deliberately.
+- Preferred verification order here is **offline first**:
+  `make check` must pass on a host with no DRM device and no loaded module.
+- Hardware tests (`tests/test_fb_*.out`) need the module loaded and `/dev/fb0`;
+  without them they exit `3` (`ENVIRONMENT_ERROR`), never `1` (`FAIL`).
+- Optional manual run after `make` + `insmod`:
+  `sudo ./tests/test_fb_fill.out /dev/fb0 f800`.
+
+## Coding style & naming
+
+- Kernel code (`drm.c`): kernel style — tabs (8 columns), `drm_tutorial_*`
+  symbol prefix, kernel-style `.clang-format`/`.clangd` at the repo root.
 - User-space C (`tests/`, `examples/drm/`): 2-space indentation, C99.
-- Python (`tools/`): PEP 8 with docstrings; GPL-2.0 SPDX header.
+- Python (`tools/`, `tests/*.py`): PEP 8 with docstrings; GPL-2.0 SPDX header.
+- Tests are named `test_<behaviour>`; reusable framebuffer access and result
+  reporting live in `tests/common/`, not duplicated per test.
 
-## Testing Guidelines
+## Commit & pull request guidelines
 
-- No test framework; tests are standalone C binaries run with `sudo` against `/dev/fb0` or `/dev/dri/card*`.
-- Naming: one behavior per program (`tests/fb_*.c`, `examples/drm/*.c`).
-- Verify behavior through dmesg callbacks (`atomic_check` to `atomic_update` to `atomic_enable`) and the driver's pixel dump.
-- `make clean` in each directory removes build artifacts (`*.out`, `*.o`, `*.ko`).
-
-## Commit & Pull Request Guidelines
-
-- Use the prefix convention from git history: `drm:`, `scripts:`, `tools:`, `tests:`, `examples:`, `docs:`, `chore:`.
-- One logical change per commit; messages in English with a concise summary line and a body explaining the why.
-- Never commit build artifacts or local config (`.gitignore` covers `*.o`, `*.ko`, `*.out`, `compile_commands.json`).
-- PRs: describe what changed, how it was verified (dmesg output), and keep the change scoped to the component named in the prefix.
-
-## Architecture Notes
-
-- Minimal atomic KMS driver: fixed 128x160 mode, RGB565 primary plane with fb damage clips, GEM DMA buffers, fbdev emulation via `drm_client_setup()`.
-- User writes to `/dev/fb0` flow through the shadow buffer, damage worker, `drm_atomic_helper_dirtyfb`, `drm_atomic_commit`, and finally `drm_tutorial_plane_helper_atomic_update`.
-- The kernel source at `~/microsoft/WSL2-Linux-Kernel` is the build target and reference; see the "Kernel source map" section in the README.
+- Use the prefix convention from git history: `drm:`, `scripts:`, `tools:`,
+  `tests:`, `examples:`, `docs:`, `chore:`.
+- One logical change per commit; messages in English with a concise summary line
+  and a body explaining the why.
+- Never commit build artifacts or local config (`.gitignore` covers `*.o`,
+  `*.ko`, `*.out`, `compile_commands.json`).
+- PRs: describe what changed and how it was verified (offline `make check`, plus
+  dmesg evidence when hardware was involved); keep the change scoped to the
+  component named in the prefix.
