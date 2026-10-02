@@ -28,6 +28,11 @@ try:
 except ImportError:
     tk = None
 
+#: Workspace CLI convention (see AGENTS.md "CLI and exit codes").  A tool that
+#: cannot reach its device reports ENVIRONMENT_ERROR, never FAIL.
+VERSION = "1.1.0"
+EXIT_ENVIRONMENT_ERROR = 3
+
 FBIOGET_VSCREENINFO = 0x4600
 VAR_FMT = "<" + "I" * 40
 VAR_SIZE = struct.calcsize(VAR_FMT)
@@ -75,7 +80,10 @@ def open_fb(path):
     try:
         return Framebuffer(path)
     except OSError as e:
-        raise SystemExit("%s: %s (try sudo)" % (path, e.strerror or e))
+        # A missing or unreadable framebuffer is an environment problem, not a
+        # failed measurement: exit 3 (ENVIRONMENT_ERROR), never 1 (FAIL).
+        print("%s: %s (try sudo)" % (path, e.strerror or e), file=sys.stderr)
+        raise SystemExit(EXIT_ENVIRONMENT_ERROR)
 
 
 def find_fb():
@@ -85,7 +93,8 @@ def find_fb():
             return Framebuffer(path)
         except OSError:
             continue
-    raise SystemExit("no /dev/fbN found (try sudo)")
+    print("no /dev/fbN found (try sudo)", file=sys.stderr)
+    raise SystemExit(EXIT_ENVIRONMENT_ERROR)
 
 
 class Converter:
@@ -256,6 +265,8 @@ def run_gui(fb, fps):
 def main():
     ap = argparse.ArgumentParser(
         description="Real-time preview of a Linux framebuffer (/dev/fbX)")
+    ap.add_argument("--version", action="version",
+                    version="%(prog)s " + VERSION)
     ap.add_argument("device", nargs="?", default=None,
                     help="/dev/fbN (default: auto-detect)")
     ap.add_argument("--fps", type=float, default=10.0,
