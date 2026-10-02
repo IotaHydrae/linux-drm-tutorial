@@ -1,65 +1,167 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# pa - print the context around a source line, with the centre line highlighted.
+#
+# Usage: pa [options] <file_path:line_number> [context_lines]
+# Example: pa <kernel-src>/drivers/gpu/drm/drm_atomic_uapi.c:808 16
+#   800             struct drm_property *property, uint64_t *val)
+#   801 {
+#   ...
+#   808             if (state->crtc && state->crtc->state->self_refresh_active)
+#
+# Default output (unchanged): every line numbered, the requested one in red, so
+# the result stays pipeable and readable in a colour-capable terminal.
+#
+# Exit codes (workspace convention): 0 success/PASS, 1 FAIL, 2 INVALID_USAGE,
+# 3 ENVIRONMENT_ERROR (file missing or unreadable), 4 TIMEOUT, 5 INCONCLUSIVE.
 
-# pa - Print 8 lines before and after a given line number, with the center line highlighted in red
-# Usage: pa <file_path:line_number>
-# Example: pa /home/developer/microsoft/WSL2-Linux-Kernel/drivers/gpu/drm/drm_atomic_uapi.c:808
-# 800             struct drm_property *property, uint64_t *val)
-# 801 {
-# 802     struct drm_device *dev = connector->dev;
-# 803     struct drm_mode_config *config = &dev->mode_config;
-# 804
-# 805     if (property == config->prop_crtc_id) {
-# 806             *val = (state->crtc) ? state->crtc->base.id : 0;
-# 807     } else if (property == config->dpms_property) {
-# 808             if (state->crtc && state->crtc->state->self_refresh_active)
-# 809                     *val = DRM_MODE_DPMS_ON;
-# 810             else
-# 811                     *val = connector->dpms;
-# 812     } else if (property == config->tv_select_subconnector_property) {
-# 813             *val = state->tv.select_subconnector;
-# 814     } else if (property == config->tv_subconnector_property) {
-# 815             *val = state->tv.subconnector;
-# 816     } else if (property == config->tv_left_margin_property) {
+set -u
 
-if [ $# -lt 1 ] || [ $# -gt 2 ]; then
-    echo "Usage: $0 <file_path:line_number> [context_lines]"
-    echo "  context_lines: number of lines before/after (default 8)"
-    echo "Example: $0 /path/to/file:1234 16"
-    exit 1
+PROG="$(basename "$0")"
+VERSION="1.0.1"
+
+JSON=0
+QUIET=0
+VERBOSE=0
+DEFAULT_CONTEXT=8
+
+usage() {
+    cat <<EOF
+$PROG - print the context around a source line, centre line highlighted
+
+Usage: $PROG [options] <file_path:line_number> [context_lines]
+
+Arguments:
+  file_path:line_number   the location to show (the trailing :N is required)
+  context_lines           lines before and after (default $DEFAULT_CONTEXT, positive integer)
+
+Options:
+  --help          show this help and exit 0
+  --version       show the version and exit 0
+  --json          emit one JSON object instead of the highlighted block
+  --quiet         suppress the context block (useful with --json)
+  --verbose       report the resolved file and range to stderr
+
+Examples:
+  $PROG <kernel-src>/drivers/gpu/drm/drm_atomic_uapi.c:808
+  $PROG <kernel-src>/drivers/gpu/drm/drm_atomic_uapi.c:808 16
+
+Exit codes: 0 success, 1 FAIL, 2 INVALID_USAGE,
+            3 ENVIRONMENT_ERROR, 4 TIMEOUT, 5 INCONCLUSIVE
+EOF
+}
+
+die_usage() {
+    printf '%s: %s\n' "$PROG" "$1" >&2
+    printf "Try '%s --help'.\n" "$PROG" >&2
+    exit 2
+}
+
+die_env() {
+    printf '%s: %s\n' "$PROG" "$1" >&2
+    exit 3
+}
+
+# --- options, possibly interleaved with the positional arguments ------------
+POS=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+    --help | -h)
+        usage
+        exit 0
+        ;;
+    --version)
+        printf '%s %s\n' "$PROG" "$VERSION"
+        exit 0
+        ;;
+    --json)
+        JSON=1
+        ;;
+    --quiet)
+        QUIET=1
+        ;;
+    --verbose)
+        VERBOSE=1
+        ;;
+    --)
+        shift
+        while [ $# -gt 0 ]; do
+            POS+=("$1")
+            shift
+        done
+        break
+        ;;
+    -*)
+        die_usage "unknown option '$1'"
+        ;;
+    *)
+        POS+=("$1")
+        ;;
+    esac
+    shift
+done
+
+if [ "${#POS[@]}" -lt 1 ] || [ "${#POS[@]}" -gt 2 ]; then
+    die_usage "expected 1 or 2 arguments, got ${#POS[@]}"
 fi
 
-input="$1"
-context=${2:-8}   # default to 8 if not provided
+input="${POS[0]}"
+context="${POS[1]:-$DEFAULT_CONTEXT}"
 
-# Validate context is a positive integer
+# Validate context is a positive integer.
 if ! [[ "$context" =~ ^[1-9][0-9]*$ ]]; then
-    echo "Error: context_lines must be a positive integer." >&2
-    exit 1
+    die_usage "context_lines must be a positive integer, got '$context'"
 fi
 
-# Extract line number (digits at the end)
-line=$(echo "$input" | grep -oE '[0-9]+$')
-# Extract file path (remove the trailing ':number')
-file=$(echo "$input" | sed 's/:[0-9]*$//')
+# The line number is the trailing :N; the path is everything before it.  The
+# separator is required, so "noseparator" is a usage error, not a filename.
+line=$(printf '%s' "$input" | grep -oE ':[0-9]+$' | tr -d ':')
+file=$(printf '%s' "$input" | sed 's/:[0-9]*$//')
 
-# Validate extraction
-if [ -z "$line" ] || [ -z "$file" ]; then
-    echo "Error: Invalid format. Expected 'file_path:line_number'." >&2
-    exit 1
+if [ -z "$line" ] || [ -z "$file" ] || [ "$file" = "$input" ]; then
+    die_usage "invalid format '$input'; expected 'file_path:line_number'"
 fi
 
-# Check if file exists and is readable
-if [ ! -f "$file" ]; then
-    echo "Error: File '$file' does not exist or is not readable." >&2
-    exit 1
+if [ ! -e "$file" ]; then
+    die_env "file '$file' does not exist"
+fi
+if [ ! -f "$file" ] || [ ! -r "$file" ]; then
+    die_env "file '$file' is not a readable regular file"
 fi
 
-# Calculate range
 start=$((line - context))
 end=$((line + context))
-[ $start -lt 1 ] && start=1
+[ "$start" -lt 1 ] && start=1
 
-# Print lines with center line highlighted in red
+if [ "$VERBOSE" -eq 1 ]; then
+    printf '%s: %s lines %d-%d (centre %d)\n' \
+        "$PROG" "$file" "$start" "$end" "$line" >&2
+fi
+
+if [ "$JSON" -eq 1 ]; then
+    awk -v s="$start" -v e="$end" -v center="$line" -v f="$file" \
+        -v ver="$VERSION" '
+        NR>=s && NR<=e {
+            text = text (NR>s ? "\n" : "") $0
+            n++
+        }
+        END {
+            gsub(/\\/, "\\\\", text)
+            gsub(/"/, "\\\"", text)
+            gsub(/\t/, "\\t", text)
+            printf "{\"tool\": \"pa\", \"version\": \"%s\", \"file\": \"%s\", " \
+                   "\"line\": %d, \"start\": %d, \"end\": %d, \"lines\": %d, " \
+                   "\"text\": \"%s\"}\n", ver, f, center, s, e, n, text
+        }
+    ' "$file"
+    exit 0
+fi
+
+if [ "$QUIET" -eq 1 ]; then
+    exit 0
+fi
+
+# Print lines with the centre line highlighted in red (the default output).
 awk -v s="$start" -v e="$end" -v center="$line" '
     NR>=s && NR<=e {
         if (NR == center)
